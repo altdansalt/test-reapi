@@ -15,7 +15,10 @@ exports_files(["go.mod"])
 go_test(
     name = "reapi_test",
     size = "medium",
-    srcs = ["reapi_test.go"],
+    srcs = [
+        "reapi_test.go",
+        "tenancy_test.go",
+    ],
     data = ["@buildbuddy_v2_290_0//file"],
     env = {"BUILDBUDDY_BINARY": "$(rootpath @buildbuddy_v2_290_0//file)"},
     # The pinned release artifact is a linux-amd64 binary.
@@ -29,7 +32,9 @@ go_test(
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//metadata",
         "@org_golang_google_grpc//status",
         "@org_golang_google_protobuf//proto",
+        "@org_modernc_sqlite//:sqlite",
     ],
 )

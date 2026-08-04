@@ -40,43 +40,89 @@ func randomBytes(rng *rand.Rand, n int) []byte {
 	return b
 }
 
-// reservePort binds an ephemeral port and keeps it held until release is
-// called, so the window between choosing a port and BuildBuddy binding it is
-// as small as we can make it without letting the server pick.
-func reservePort(t *testing.T) (port int, release func()) {
+// reservePorts binds n ephemeral ports and holds them until release is called,
+// so the window between choosing a port and BuildBuddy binding it is as small
+// as we can make it without letting the server pick.
+func reservePorts(t *testing.T, n int) (ports []int, release func()) {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	listeners := make([]net.Listener, 0, n)
+	ports = make([]int, 0, n)
+	release = func() {
+		for _, l := range listeners {
+			_ = l.Close()
+		}
 	}
-	return l.Addr().(*net.TCPAddr).Port, func() { _ = l.Close() }
+	for i := 0; i < n; i++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		listeners = append(listeners, l)
+		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
+	}
+	return ports, release
 }
 
-// startBuildBuddy launches the server and returns its gRPC port plus a channel
-// closed when the process exits, so callers can distinguish "still starting"
-// from "already dead".
-func startBuildBuddy(t *testing.T) (int, <-chan struct{}) {
+// instance describes a running BuildBuddy process.
+type instance struct {
+	grpcPort int
+	// dataSource is the path to the server's SQLite database, which tests use
+	// to seed rows the app's own API cannot create without an identity
+	// provider.
+	dataSource string
+	// exited is closed when the process terminates, so callers can distinguish
+	// "still starting" from "already dead".
+	exited <-chan struct{}
+}
+
+type startOption func(*[]string)
+
+// withFlags appends extra command line flags to the server under test.
+func withFlags(flags ...string) startOption {
+	return func(args *[]string) { *args = append(*args, flags...) }
+}
+
+// startBuildBuddy launches the server and waits for nothing; callers await
+// readiness themselves.
+func startBuildBuddy(t *testing.T, opts ...startOption) instance {
 	t.Helper()
 	app := os.Getenv("BUILDBUDDY_BINARY")
 	if app == "" {
 		t.Fatal("BUILDBUDDY_BINARY is not set")
 	}
 	state := t.TempDir()
-	grpcPort, releaseGRPC := reservePort(t)
-	httpPort, releaseHTTP := reservePort(t)
+	dbPath := filepath.Join(state, "buildbuddy.db")
+	// BuildBuddy binds more than the two ports this test talks to, and the rest
+	// default to fixed values (9090 monitoring, 9099 telemetry, 1986-1988
+	// internal, 8081 TLS). Leaving them unset makes two instances on one
+	// machine collide, which breaks --runs_per_test, parallel Bazel jobs, and
+	// any developer who happens to have something on 9090.
+	ports, releasePorts := reservePorts(t, 8)
+	grpcPort := ports[0]
 	args := []string{
 		"--grpc_port=" + strconv.Itoa(grpcPort),
-		"--port=" + strconv.Itoa(httpPort),
+		"--port=" + strconv.Itoa(ports[1]),
+		"--grpcs_port=" + strconv.Itoa(ports[2]),
+		"--internal_grpc_port=" + strconv.Itoa(ports[3]),
+		"--internal_grpcs_port=" + strconv.Itoa(ports[4]),
+		"--monitoring_port=" + strconv.Itoa(ports[5]),
+		"--telemetry_port=" + strconv.Itoa(ports[6]),
+		"--ssl_port=" + strconv.Itoa(ports[7]),
 		"--cache.in_memory=true",
 		"--cache.max_size_bytes=268435456",
 		"--remote_execution.enable_remote_exec=false",
 		"--auth.enable_anonymous_usage=true",
 		"--disable_telemetry=true",
-		"--database.data_source=sqlite3://" + filepath.Join(state, "buildbuddy.db"),
+		"--database.data_source=sqlite3://" + dbPath,
 		// Blobstore for invocation artifacts; distinct from the cache above and
 		// defaulted to a shared /tmp path, so it must be pinned per test.
 		"--storage.disk.root_directory=" + filepath.Join(state, "storage"),
 		"--app.log_level=warn",
+	}
+	// Later flags win, so options can override any default above.
+	for _, opt := range opts {
+		opt(&args)
 	}
 	cmd := exec.Command(app, args...)
 	logPath := filepath.Join(state, "server.log")
@@ -85,8 +131,7 @@ func startBuildBuddy(t *testing.T) (int, <-chan struct{}) {
 		t.Fatal(err)
 	}
 	cmd.Stdout, cmd.Stderr = logFile, logFile
-	releaseGRPC()
-	releaseHTTP()
+	releasePorts()
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start BuildBuddy: %v", err)
 	}
@@ -107,7 +152,7 @@ func startBuildBuddy(t *testing.T) (int, <-chan struct{}) {
 			}
 		}
 	})
-	return grpcPort, exited
+	return instance{grpcPort: grpcPort, dataSource: dbPath, exited: exited}
 }
 
 func awaitReady(t *testing.T, conn *grpc.ClientConn, exited <-chan struct{}) {
@@ -140,6 +185,9 @@ type clients struct {
 	// server is fetched once at startup so operations can probe the limits the
 	// server actually advertises rather than limits we guessed.
 	server *repb.ServerCapabilities
+	// tenants is populated only by the multi-tenant test; isolation operations
+	// need more than one identity to compare.
+	tenants []tenant
 }
 
 // maxBatchSize is the batch ceiling the server advertises, or the REAPI default
@@ -1074,13 +1122,13 @@ func TestRandomREAPICacheTraffic(t *testing.T) {
 		iterations = parsed
 	}
 
-	port, exited := startBuildBuddy(t)
-	conn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", port), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	inst := startBuildBuddy(t)
+	conn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", inst.grpcPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	awaitReady(t, conn, exited)
+	awaitReady(t, conn, inst.exited)
 
 	c := &clients{
 		cas:  repb.NewContentAddressableStorageClient(conn),
