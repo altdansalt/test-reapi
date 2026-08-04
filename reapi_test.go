@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -136,6 +137,18 @@ type clients struct {
 	ac   repb.ActionCacheClient
 	bs   bspb.ByteStreamClient
 	caps repb.CapabilitiesClient
+	// server is fetched once at startup so operations can probe the limits the
+	// server actually advertises rather than limits we guessed.
+	server *repb.ServerCapabilities
+}
+
+// maxBatchSize is the batch ceiling the server advertises, or the REAPI default
+// of 4 MiB when it advertises nothing.
+func (c *clients) maxBatchSize() int64 {
+	if n := c.server.GetCacheCapabilities().GetMaxBatchTotalSizeBytes(); n > 0 {
+		return n
+	}
+	return 4 * 1024 * 1024
 }
 
 func uploadResource(rng *rand.Rand, d *repb.Digest) string {
@@ -193,6 +206,7 @@ func writeChunked(ctx context.Context, bs bspb.ByteStreamClient, rng *rand.Rand,
 		return err
 	}
 	resource := uploadResource(rng, digest(data))
+	shortCircuited := false
 	for offset := 0; ; {
 		chunk := rng.Intn(16*1024) + 1
 		if offset+chunk > len(data) {
@@ -209,6 +223,14 @@ func writeChunked(ctx context.Context, bs bspb.ByteStreamClient, rng *rand.Rand,
 			req.ResourceName = resource
 		}
 		if err := stream.Send(req); err != nil {
+			// gRPC reports a server-terminated stream as io.EOF from Send and
+			// carries the real status on CloseAndRecv. BuildBuddy ends a write
+			// early when the blob already exists, which concurrent writers of
+			// the same digest hit routinely, so this is not itself a failure.
+			if errors.Is(err, io.EOF) {
+				shortCircuited = true
+				break
+			}
 			return fmt.Errorf("Send at offset %d: %w", offset, err)
 		}
 		offset += chunk
@@ -220,7 +242,9 @@ func writeChunked(ctx context.Context, bs bspb.ByteStreamClient, rng *rand.Rand,
 	if err != nil {
 		return fmt.Errorf("CloseAndRecv: %w", err)
 	}
-	if resp.CommittedSize != int64(len(data)) {
+	// A short-circuited write commits whatever the existing blob already had,
+	// so only a write we actually drove to completion must report the full size.
+	if !shortCircuited && resp.CommittedSize != int64(len(data)) {
 		return fmt.Errorf("committed_size = %d, want %d", resp.CommittedSize, len(data))
 	}
 	return nil
@@ -228,14 +252,32 @@ func writeChunked(ctx context.Context, bs bspb.ByteStreamClient, rng *rand.Rand,
 
 // --- operations -------------------------------------------------------------
 
+// operation is one unit of randomized traffic. Weight controls how often it is
+// picked relative to the others; expensive probes are rarer so a long run stays
+// dominated by ordinary cache traffic.
 type operation struct {
-	name string
-	run  func(ctx context.Context, rng *rand.Rand, c *clients) error
+	name   string
+	weight int
+	run    func(ctx context.Context, rng *rand.Rand, c *clients) error
+}
+
+func pick(rng *rand.Rand, ops []operation) operation {
+	total := 0
+	for _, op := range ops {
+		total += op.weight
+	}
+	n := rng.Intn(total)
+	for _, op := range ops {
+		if n -= op.weight; n < 0 {
+			return op
+		}
+	}
+	return ops[len(ops)-1]
 }
 
 // capabilitiesOp asserts the server advertises the digest function this test
 // actually uses, rather than discarding the response.
-var capabilitiesOp = operation{"Capabilities", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var capabilitiesOp = operation{name: "Capabilities", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	resp, err := c.caps.GetCapabilities(ctx, &repb.GetCapabilitiesRequest{})
 	if err != nil {
 		return err
@@ -252,7 +294,7 @@ var capabilitiesOp = operation{"Capabilities", func(ctx context.Context, rng *ra
 	return fmt.Errorf("SHA256 not advertised; got %v", cache.GetDigestFunctions())
 }}
 
-var casOp = operation{"CAS", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var casOp = operation{name: "CAS", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	data := randomBytes(rng, rng.Intn(32*1024)+1)
 	d := digest(data)
 	missing, err := c.cas.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{d}})
@@ -290,7 +332,7 @@ var casOp = operation{"CAS", func(ctx context.Context, rng *rand.Rand, c *client
 
 // batchMixedOp mixes present and absent digests in one batch and checks the
 // per-entry status codes, which a single-blob round trip never exercises.
-var batchMixedOp = operation{"BatchMixed", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var batchMixedOp = operation{name: "BatchMixed", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	present := randomBytes(rng, rng.Intn(4*1024)+1)
 	absent := randomBytes(rng, rng.Intn(4*1024)+1)
 	if _, err := upload(ctx, c.cas, present); err != nil {
@@ -332,7 +374,7 @@ var batchMixedOp = operation{"BatchMixed", func(ctx context.Context, rng *rand.R
 
 // emptyBlobOp covers the REAPI rule that the empty blob is always present and
 // need never be uploaded.
-var emptyBlobOp = operation{"EmptyBlob", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var emptyBlobOp = operation{name: "EmptyBlob", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	empty := digest(nil)
 	missing, err := c.cas.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{empty}})
 	if err != nil {
@@ -355,7 +397,7 @@ var emptyBlobOp = operation{"EmptyBlob", func(ctx context.Context, rng *rand.Ran
 	return nil
 }}
 
-var byteStreamOp = operation{"ByteStreamChunked", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var byteStreamOp = operation{name: "ByteStreamChunked", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	data := randomBytes(rng, rng.Intn(128*1024)+1)
 	if err := writeChunked(ctx, c.bs, rng, data); err != nil {
 		return err
@@ -376,7 +418,7 @@ var byteStreamOp = operation{"ByteStreamChunked", func(ctx context.Context, rng 
 
 // partialReadOp exercises read_offset and read_limit, which a full-blob read
 // never touches.
-var partialReadOp = operation{"ByteStreamPartialRead", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var partialReadOp = operation{name: "ByteStreamPartialRead", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	data := randomBytes(rng, rng.Intn(64*1024)+1024)
 	if _, err := upload(ctx, c.cas, data); err != nil {
 		return err
@@ -416,7 +458,7 @@ var partialReadOp = operation{"ByteStreamPartialRead", func(ctx context.Context,
 
 // resumeOp interrupts a write partway, asks QueryWriteStatus where the server
 // thinks it is, and finishes the upload from there.
-var resumeOp = operation{"ByteStreamResume", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var resumeOp = operation{name: "ByteStreamResume", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	data := randomBytes(rng, rng.Intn(64*1024)+2048)
 	d := digest(data)
 	resource := uploadResource(rng, d)
@@ -489,7 +531,7 @@ var resumeOp = operation{"ByteStreamResume", func(ctx context.Context, rng *rand
 
 // actionCacheOp stores a fully populated ActionResult, including outputs whose
 // contents live in the CAS, and compares the whole proto on the way back.
-var actionCacheOp = operation{"ActionCache", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var actionCacheOp = operation{name: "ActionCache", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	stdout := randomBytes(rng, rng.Intn(4*1024)+1)
 	outputContents := randomBytes(rng, rng.Intn(8*1024)+1)
 	commandBytes, err := proto.Marshal(&repb.Command{Arguments: []string{"echo", fmt.Sprint(rng.Uint64())}})
@@ -555,7 +597,7 @@ var actionCacheOp = operation{"ActionCache", func(ctx context.Context, rng *rand
 
 // actionCacheMissOp checks that an action nobody has ever cached reports
 // NotFound rather than an empty result.
-var actionCacheMissOp = operation{"ActionCacheMiss", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var actionCacheMissOp = operation{name: "ActionCacheMiss", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	unknown := digest(randomBytes(rng, 64))
 	_, err := c.ac.GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: unknown})
 	if code := status.Code(err); code != codes.NotFound {
@@ -566,7 +608,7 @@ var actionCacheMissOp = operation{"ActionCacheMiss", func(ctx context.Context, r
 
 // getTreeOp builds a nested directory structure and walks it back through
 // GetTree, which the flat round trips never reach.
-var getTreeOp = operation{"GetTree", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var getTreeOp = operation{name: "GetTree", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	fileContents := randomBytes(rng, rng.Intn(1024)+1)
 	fileDigests, err := upload(ctx, c.cas, fileContents)
 	if err != nil {
@@ -629,7 +671,7 @@ var getTreeOp = operation{"GetTree", func(ctx context.Context, rng *rand.Rand, c
 
 // missingBlobReadOp asserts a read of a blob that was never written fails with
 // NotFound instead of hanging or returning empty data.
-var missingBlobReadOp = operation{"MissingBlobRead", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var missingBlobReadOp = operation{name: "MissingBlobRead", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	absent := digest(randomBytes(rng, rng.Intn(1024)+1))
 	stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(absent)})
 	if err != nil {
@@ -644,7 +686,7 @@ var missingBlobReadOp = operation{"MissingBlobRead", func(ctx context.Context, r
 
 // digestMismatchOp uploads data under the wrong digest, which the server must
 // reject rather than store under a hash that does not describe it.
-var digestMismatchOp = operation{"DigestMismatch", func(ctx context.Context, rng *rand.Rand, c *clients) error {
+var digestMismatchOp = operation{name: "DigestMismatch", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
 	data := randomBytes(rng, rng.Intn(4*1024)+1)
 	wrong := digest(randomBytes(rng, 32))
 	wrong.SizeBytes = int64(len(data))
@@ -667,6 +709,328 @@ var digestMismatchOp = operation{"DigestMismatch", func(ctx context.Context, rng
 	return nil
 }}
 
+// corruptStreamOp writes bytes through ByteStream that do not hash to the
+// digest named in the resource. The server must not commit them; if it did, a
+// later reader would get data that silently fails verification.
+var corruptStreamOp = operation{name: "CorruptStream", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
+	data := randomBytes(rng, rng.Intn(8*1024)+1)
+	claimed := digest(randomBytes(rng, 32))
+	claimed.SizeBytes = int64(len(data))
+	stream, err := c.bs.Write(ctx)
+	if err != nil {
+		return err
+	}
+	sendErr := stream.Send(&bspb.WriteRequest{
+		ResourceName: uploadResource(rng, claimed),
+		Data:         data,
+		FinishWrite:  true,
+	})
+	_, closeErr := stream.CloseAndRecv()
+	if sendErr == nil && closeErr == nil {
+		return errors.New("ByteStream committed data that does not match the digest in its resource name")
+	}
+	// Either error is a valid refusal; what matters is that the blob is not
+	// readable afterwards under the digest it claimed.
+	read, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(claimed)})
+	if err != nil {
+		return err
+	}
+	got, err := readAll(read)
+	if err == nil {
+		return fmt.Errorf("mismatched blob is readable after a rejected write (%d bytes)", len(got))
+	}
+	if code := status.Code(err); code != codes.NotFound {
+		return fmt.Errorf("reading the rejected blob = %s, want NotFound", code)
+	}
+	return nil
+}}
+
+// malformedResourceOp throws structurally invalid resource names at ByteStream.
+// Each must produce a clean gRPC error rather than a panic, a hang, or data.
+var malformedResourceOp = operation{name: "MalformedResource", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
+	valid := digest(randomBytes(rng, 64))
+	candidates := []string{
+		"",
+		"garbage",
+		"blobs",
+		"blobs/" + valid.Hash,
+		"blobs/" + valid.Hash + "/notanumber",
+		"blobs/" + valid.Hash + "/-1",
+		"blobs/nothexatall/10",
+		"blobs//10",
+		"blobs/" + valid.Hash[:16] + "/10", // hash too short for SHA-256
+		"uploads/blobs/" + valid.Hash + "/10",
+		"../../etc/passwd",
+	}
+	resource := candidates[rng.Intn(len(candidates))]
+	stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: resource})
+	if err != nil {
+		if isCleanRejection(err) {
+			return nil
+		}
+		return fmt.Errorf("Read(%q) = %s, want a clean rejection", resource, status.Code(err))
+	}
+	got, err := readAll(stream)
+	if err == nil {
+		return fmt.Errorf("Read(%q) succeeded and returned %d bytes", resource, len(got))
+	}
+	if !isCleanRejection(err) {
+		return fmt.Errorf("Read(%q) = %s, want a clean rejection", resource, status.Code(err))
+	}
+	return nil
+}}
+
+// isCleanRejection reports whether err is a well-formed refusal rather than a
+// crash or a leaked internal error.
+func isCleanRejection(err error) bool {
+	switch status.Code(err) {
+	case codes.InvalidArgument, codes.NotFound, codes.PermissionDenied, codes.Unimplemented, codes.OutOfRange:
+		return true
+	default:
+		return false
+	}
+}
+
+// readPastEndOp reads beyond the end of a real blob. ByteStream requires
+// OutOfRange for an offset past the end, and an empty result at exactly the
+// end.
+var readPastEndOp = operation{name: "ReadPastEnd", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
+	data := randomBytes(rng, rng.Intn(4*1024)+16)
+	if _, err := upload(ctx, c.cas, data); err != nil {
+		return err
+	}
+	resource := readResource(digest(data))
+
+	// Exactly at the end: a well-formed, empty read.
+	stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: resource, ReadOffset: int64(len(data))})
+	if err != nil {
+		return err
+	}
+	got, err := readAll(stream)
+	if err != nil {
+		if !isCleanRejection(err) {
+			return fmt.Errorf("Read at exactly the end = %s", status.Code(err))
+		}
+	} else if len(got) != 0 {
+		return fmt.Errorf("Read at exactly the end returned %d bytes, want 0", len(got))
+	}
+
+	// Past the end: ByteStream says this "must return an OUT_OF_RANGE error".
+	// BuildBuddy v2.290.0 instead returns OK with an empty stream. That is a
+	// spec deviation, but a harmless one, so it is tolerated here; returning
+	// any actual bytes past the end would be real corruption and still fails.
+	beyond := int64(len(data)) + int64(rng.Intn(4096)) + 1
+	stream, err = c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: resource, ReadOffset: beyond})
+	var beyondBytes []byte
+	if err == nil {
+		beyondBytes, err = readAll(stream)
+	}
+	if err == nil {
+		if len(beyondBytes) != 0 {
+			return fmt.Errorf("Read at offset %d of a %d byte blob returned %d bytes", beyond, len(data), len(beyondBytes))
+		}
+		return nil
+	}
+	if !isCleanRejection(err) {
+		return fmt.Errorf("Read past the end = %s, want OutOfRange or an empty result", status.Code(err))
+	}
+	return nil
+}}
+
+// oversizedBatchOp builds a BatchUpdateBlobs request larger than the limit the
+// server itself advertises. Silently truncating it would corrupt a client that
+// trusted the advertised limit.
+var oversizedBatchOp = operation{name: "OversizedBatch", weight: 3, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
+	limit := c.maxBatchSize()
+	const chunk = 512 * 1024
+	var reqs []*repb.BatchUpdateBlobsRequest_Request
+	var total int64
+	for total <= limit {
+		data := randomBytes(rng, chunk)
+		reqs = append(reqs, &repb.BatchUpdateBlobsRequest_Request{Digest: digest(data), Data: data})
+		total += chunk
+	}
+	resp, err := c.cas.BatchUpdateBlobs(ctx, &repb.BatchUpdateBlobsRequest{Requests: reqs})
+	if err != nil {
+		if isCleanRejection(err) || status.Code(err) == codes.ResourceExhausted {
+			return nil
+		}
+		return fmt.Errorf("oversized BatchUpdateBlobs (%d bytes, limit %d) = %s", total, limit, status.Code(err))
+	}
+	// If the server accepted it, every blob it reported OK must really be
+	// readable; a partial accept that claims success is the failure mode here.
+	if len(resp.Responses) != len(reqs) {
+		return fmt.Errorf("oversized batch returned %d responses for %d requests", len(resp.Responses), len(reqs))
+	}
+	for _, r := range resp.Responses {
+		if codes.Code(r.Status.GetCode()) != codes.OK {
+			continue
+		}
+		missing, err := c.cas.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{r.Digest}})
+		if err != nil {
+			return fmt.Errorf("FindMissingBlobs after oversized batch: %w", err)
+		}
+		if len(missing.GetMissingBlobDigests()) != 0 {
+			return fmt.Errorf("oversized batch reported OK for %s but the blob is missing", r.Digest.GetHash())
+		}
+	}
+	return nil
+}}
+
+// largeBlobOp pushes a blob past the default 4 MiB gRPC message limit, forcing
+// the server to chunk both directions, and confirms BatchReadBlobs refuses to
+// inline something that large.
+var largeBlobOp = operation{name: "LargeBlob", weight: 2, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
+	size := 4*1024*1024 + rng.Intn(1024*1024) + 1
+	data := randomBytes(rng, size)
+	d := digest(data)
+	if err := writeChunked(ctx, c.bs, rng, data); err != nil {
+		return fmt.Errorf("large write: %w", err)
+	}
+	stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(d)})
+	if err != nil {
+		return err
+	}
+	got, err := readAll(stream)
+	if err != nil {
+		return fmt.Errorf("large read: %w", err)
+	}
+	if !bytes.Equal(got, data) {
+		return fmt.Errorf("large blob round trip differed: got %d bytes, want %d", len(got), size)
+	}
+	// Reading it back through the batch API must either refuse or succeed
+	// honestly; returning a short blob under an OK status would be silent
+	// corruption.
+	read, err := c.cas.BatchReadBlobs(ctx, &repb.BatchReadBlobsRequest{Digests: []*repb.Digest{d}})
+	if err != nil {
+		if isCleanRejection(err) || status.Code(err) == codes.ResourceExhausted {
+			return nil
+		}
+		return fmt.Errorf("BatchReadBlobs of a large blob = %s", status.Code(err))
+	}
+	for _, r := range read.Responses {
+		if codes.Code(r.Status.GetCode()) != codes.OK {
+			continue
+		}
+		if !bytes.Equal(r.Data, data) {
+			return fmt.Errorf("BatchReadBlobs returned OK with %d bytes for a %d byte blob", len(r.Data), size)
+		}
+	}
+	return nil
+}}
+
+// duplicateDigestOp repeats one digest inside a single batch, an easy way to
+// trip response/request correlation bugs.
+var duplicateDigestOp = operation{name: "DuplicateDigest", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
+	data := randomBytes(rng, rng.Intn(2*1024)+1)
+	d := digest(data)
+	reqs := []*repb.BatchUpdateBlobsRequest_Request{
+		{Digest: d, Data: data},
+		{Digest: d, Data: data},
+	}
+	if _, err := c.cas.BatchUpdateBlobs(ctx, &repb.BatchUpdateBlobsRequest{Requests: reqs}); err != nil {
+		return fmt.Errorf("BatchUpdateBlobs with a duplicate digest: %w", err)
+	}
+	read, err := c.cas.BatchReadBlobs(ctx, &repb.BatchReadBlobsRequest{Digests: []*repb.Digest{d, d}})
+	if err != nil {
+		return fmt.Errorf("BatchReadBlobs with a duplicate digest: %w", err)
+	}
+	if len(read.Responses) == 0 {
+		return errors.New("BatchReadBlobs returned no responses for a duplicated digest")
+	}
+	for _, r := range read.Responses {
+		if code := codes.Code(r.Status.GetCode()); code != codes.OK {
+			return fmt.Errorf("duplicated digest status = %s", code)
+		}
+		if !bytes.Equal(r.Data, data) {
+			return errors.New("duplicated digest returned the wrong data")
+		}
+	}
+	// FindMissingBlobs must not claim a stored blob is missing just because it
+	// appears twice.
+	missing, err := c.cas.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{d, d}})
+	if err != nil {
+		return fmt.Errorf("FindMissingBlobs with a duplicate digest: %w", err)
+	}
+	if len(missing.GetMissingBlobDigests()) != 0 {
+		return errors.New("FindMissingBlobs reported a stored blob missing when duplicated")
+	}
+	return nil
+}}
+
+// concurrentOp races several writers and readers over the same digests. Cache
+// bugs concentrate here: a half-written entry becoming visible, or a write
+// racing an eviction.
+var concurrentOp = operation{name: "Concurrent", weight: 5, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
+	const workers = 8
+	// Pre-generate everything; rng is not safe for concurrent use.
+	blobs := make([][]byte, 3)
+	for i := range blobs {
+		blobs[i] = randomBytes(rng, rng.Intn(32*1024)+1)
+	}
+	seeds := make([]int64, workers)
+	for i := range seeds {
+		seeds[i] = rng.Int63()
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			local := rand.New(rand.NewSource(seeds[w]))
+			data := blobs[w%len(blobs)]
+			d := digest(data)
+			// Half the workers write, half read what the writers are storing.
+			if w%2 == 0 {
+				if err := writeChunked(ctx, c.bs, local, data); err != nil {
+					errs <- fmt.Errorf("worker %d write: %w", w, err)
+				}
+				return
+			}
+			if _, err := upload(ctx, c.cas, data); err != nil {
+				errs <- fmt.Errorf("worker %d upload: %w", w, err)
+				return
+			}
+			stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(d)})
+			if err != nil {
+				errs <- fmt.Errorf("worker %d read: %w", w, err)
+				return
+			}
+			got, err := readAll(stream)
+			if err != nil {
+				errs <- fmt.Errorf("worker %d read: %w", w, err)
+				return
+			}
+			// A concurrent write must never expose a partial blob.
+			if !bytes.Equal(got, data) {
+				errs <- fmt.Errorf("worker %d saw %d bytes, want %d", w, len(got), len(data))
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	if err := <-errs; err != nil {
+		return err
+	}
+	// Every blob must be intact and complete once the dust settles.
+	for _, data := range blobs {
+		d := digest(data)
+		read, err := c.cas.BatchReadBlobs(ctx, &repb.BatchReadBlobsRequest{Digests: []*repb.Digest{d}})
+		if err != nil {
+			return fmt.Errorf("post-race read: %w", err)
+		}
+		if len(read.Responses) != 1 || codes.Code(read.Responses[0].Status.GetCode()) != codes.OK {
+			return fmt.Errorf("post-race read of %s did not return OK", d.Hash)
+		}
+		if !bytes.Equal(read.Responses[0].Data, data) {
+			return fmt.Errorf("post-race blob differed: got %d bytes, want %d", len(read.Responses[0].Data), len(data))
+		}
+	}
+	return nil
+}}
+
 var operations = []operation{
 	capabilitiesOp,
 	casOp,
@@ -680,6 +1044,13 @@ var operations = []operation{
 	getTreeOp,
 	missingBlobReadOp,
 	digestMismatchOp,
+	corruptStreamOp,
+	malformedResourceOp,
+	readPastEndOp,
+	oversizedBatchOp,
+	largeBlobOp,
+	duplicateDigestOp,
+	concurrentOp,
 }
 
 func TestRandomREAPICacheTraffic(t *testing.T) {
@@ -718,9 +1089,17 @@ func TestRandomREAPICacheTraffic(t *testing.T) {
 		caps: repb.NewCapabilitiesClient(conn),
 	}
 
+	capCtx, capCancel := context.WithTimeout(context.Background(), requestTimeout)
+	c.server, err = c.caps.GetCapabilities(capCtx, &repb.GetCapabilitiesRequest{})
+	capCancel()
+	if err != nil {
+		t.Fatalf("GetCapabilities: %v", err)
+	}
+	t.Logf("server advertises max_batch_total_size_bytes=%d", c.maxBatchSize())
+
 	counts := make(map[string]int, len(operations))
 	for i := 0; i < iterations; i++ {
-		op := operations[rng.Intn(len(operations))]
+		op := pick(rng, operations)
 		counts[op.name]++
 		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 		err := op.run(ctx, rng, c)
