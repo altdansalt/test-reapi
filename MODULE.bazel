@@ -1,0 +1,37 @@
+module(
+    name = "buildbuddy_reapi_test",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "gazelle", version = "0.52.2")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_go", version = "0.62.0")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.24.12")
+
+go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
+go_deps.from_file(go_mod = "//:go.mod")
+go_deps.gazelle_override(
+    build_file_generation = "clean",
+    directives = ["gazelle:proto disable"],
+    path = "github.com/bazelbuild/remote-apis",
+)
+use_repo(
+    go_deps,
+    "com_github_bazelbuild_remote_apis",
+    "org_golang_google_genproto_googleapis_bytestream",
+    "org_golang_google_grpc",
+    "org_golang_google_protobuf",
+)
+
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+# The server under test is the unmodified v2.290.0 release artifact.
+http_file(
+    name = "buildbuddy_v2_290_0",
+    downloaded_file_path = "buildbuddy-enterprise-linux-amd64",
+    executable = True,
+    integrity = "sha256-lcYQUuOcuFZKo+tsTTiGLjr47ZLz5qtJn3t9VJubL/0=",
+    urls = ["https://github.com/buildbuddy-io/buildbuddy/releases/download/v2.290.0/buildbuddy-enterprise-linux-amd64"],
+)

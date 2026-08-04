@@ -1,0 +1,35 @@
+load("@gazelle//:def.bzl", "gazelle")
+load("@rules_go//go:def.bzl", "go_test")
+
+# The single test target below is hand-maintained: it needs data, env, and
+# target_compatible_with that gazelle cannot infer, and gazelle's naming
+# convention for this module would generate a second go_test over the same
+# srcs rather than updating this one. Keep //:gazelle for go.mod resolution
+# via the go_deps extension, but leave this file alone.
+# gazelle:ignore
+
+gazelle(name = "gazelle")
+
+exports_files(["go.mod"])
+
+go_test(
+    name = "reapi_test",
+    size = "medium",
+    srcs = ["reapi_test.go"],
+    data = ["@buildbuddy_v2_290_0//file"],
+    env = {"BUILDBUDDY_BINARY": "$(rootpath @buildbuddy_v2_290_0//file)"},
+    # The pinned release artifact is a linux-amd64 binary.
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    deps = [
+        "@com_github_bazelbuild_remote_apis//build/bazel/remote/execution/v2:execution",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//status",
+        "@org_golang_google_protobuf//proto",
+    ],
+)
