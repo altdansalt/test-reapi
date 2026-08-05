@@ -27,7 +27,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const requestTimeout = 10 * time.Second
+const (
+	requestTimeout   = 10 * time.Second
+	testCacheMaxSize = 32 * 1024 * 1024
+)
 
 func digest(data []byte) *repb.Digest {
 	sum := sha256.Sum256(data)
@@ -110,7 +113,7 @@ func startBuildBuddy(t *testing.T, opts ...startOption) instance {
 		"--telemetry_port=" + strconv.Itoa(ports[6]),
 		"--ssl_port=" + strconv.Itoa(ports[7]),
 		"--cache.in_memory=true",
-		"--cache.max_size_bytes=268435456",
+		"--cache.max_size_bytes=" + strconv.Itoa(testCacheMaxSize),
 		"--remote_execution.enable_remote_exec=false",
 		"--auth.enable_anonymous_usage=true",
 		"--disable_telemetry=true",
@@ -634,11 +637,17 @@ var actionCacheOp = operation{name: "ActionCache", weight: 10, run: func(ctx con
 	if got.OutputFiles[0].Path != want.OutputFiles[0].Path {
 		return fmt.Errorf("output path = %q, want %q", got.OutputFiles[0].Path, want.OutputFiles[0].Path)
 	}
+	if got.OutputFiles[0].IsExecutable != want.OutputFiles[0].IsExecutable {
+		return fmt.Errorf("output executable = %v, want %v", got.OutputFiles[0].IsExecutable, want.OutputFiles[0].IsExecutable)
+	}
 	if !proto.Equal(got.OutputFiles[0].Digest, outputDigest) {
 		return fmt.Errorf("output digest = %v, want %v", got.OutputFiles[0].Digest, outputDigest)
 	}
 	if !proto.Equal(got.StdoutDigest, stdoutDigest) {
 		return fmt.Errorf("stdout digest = %v, want %v", got.StdoutDigest, stdoutDigest)
+	}
+	if !proto.Equal(got.ExecutionMetadata, want.ExecutionMetadata) {
+		return fmt.Errorf("execution metadata differed: got %v, want %v", got.ExecutionMetadata, want.ExecutionMetadata)
 	}
 	return nil
 }}
@@ -983,10 +992,13 @@ var duplicateDigestOp = operation{name: "DuplicateDigest", weight: 10, run: func
 	if err != nil {
 		return fmt.Errorf("BatchReadBlobs with a duplicate digest: %w", err)
 	}
-	if len(read.Responses) == 0 {
-		return errors.New("BatchReadBlobs returned no responses for a duplicated digest")
+	if len(read.Responses) != 2 {
+		return fmt.Errorf("BatchReadBlobs returned %d responses for 2 duplicated requests", len(read.Responses))
 	}
 	for _, r := range read.Responses {
+		if r.Digest.GetHash() != d.Hash || r.Digest.GetSizeBytes() != d.SizeBytes {
+			return fmt.Errorf("duplicated digest response identified %v, want %v", r.Digest, d)
+		}
 		if code := codes.Code(r.Status.GetCode()); code != codes.OK {
 			return fmt.Errorf("duplicated digest status = %s", code)
 		}
@@ -1002,6 +1014,166 @@ var duplicateDigestOp = operation{name: "DuplicateDigest", weight: 10, run: func
 	}
 	if len(missing.GetMissingBlobDigests()) != 0 {
 		return errors.New("FindMissingBlobs reported a stored blob missing when duplicated")
+	}
+	return nil
+}}
+
+// modelEntry is the test's view of a blob. The model deliberately records only
+// writes which the server acknowledged; every later API is checked against the
+// same state, so the sequence catches disagreement between CAS and ByteStream.
+type modelEntry struct {
+	digest *repb.Digest
+	data   []byte
+}
+
+// statefulSequenceOp runs a small, dependent command sequence rather than a
+// collection of independent round trips. Each decision changes a reference
+// model which subsequent randomly selected commands must agree with.
+var statefulSequenceOp = operation{name: "StatefulSequence", weight: 10, run: func(ctx context.Context, rng *rand.Rand, c *clients) error {
+	model := make(map[string]modelEntry)
+	unknown := func() *repb.Digest {
+		for {
+			d := digest(randomBytes(rng, rng.Intn(256)+1))
+			if _, ok := model[d.Hash]; !ok {
+				return d
+			}
+		}
+	}
+	pickEntry := func() modelEntry {
+		n := rng.Intn(len(model))
+		for _, entry := range model {
+			if n == 0 {
+				return entry
+			}
+			n--
+		}
+		panic("unreachable")
+	}
+
+	steps := rng.Intn(25) + 25
+	for step := 0; step < steps; step++ {
+		command := rng.Intn(8)
+		if len(model) == 0 {
+			command = rng.Intn(2)
+		}
+		switch command {
+		case 0: // Batch write, later consumed through both APIs.
+			data := randomBytes(rng, rng.Intn(32*1024)+1)
+			ds, err := upload(ctx, c.cas, data)
+			if err != nil {
+				return fmt.Errorf("step %d batch write: %w", step, err)
+			}
+			model[ds[0].Hash] = modelEntry{digest: ds[0], data: data}
+		case 1: // ByteStream write, later consumed through CAS.
+			data := randomBytes(rng, rng.Intn(64*1024)+1)
+			if err := writeChunked(ctx, c.bs, rng, data); err != nil {
+				return fmt.Errorf("step %d stream write: %w", step, err)
+			}
+			d := digest(data)
+			model[d.Hash] = modelEntry{digest: d, data: data}
+		case 2: // Mixed present/absent batch read, in randomized order.
+			entry, absent := pickEntry(), unknown()
+			digests := []*repb.Digest{entry.digest, absent}
+			if rng.Intn(2) == 0 {
+				digests[0], digests[1] = digests[1], digests[0]
+			}
+			resp, err := c.cas.BatchReadBlobs(ctx, &repb.BatchReadBlobsRequest{Digests: digests})
+			if err != nil {
+				return fmt.Errorf("step %d model batch read: %w", step, err)
+			}
+			if len(resp.Responses) != 2 {
+				return fmt.Errorf("step %d model batch read returned %d responses, want 2", step, len(resp.Responses))
+			}
+			seen := make(map[string]int)
+			for _, got := range resp.Responses {
+				seen[got.Digest.GetHash()]++
+				switch got.Digest.GetHash() {
+				case entry.digest.Hash:
+					if codes.Code(got.Status.GetCode()) != codes.OK || !bytes.Equal(got.Data, entry.data) {
+						return fmt.Errorf("step %d present model blob returned status %s and %d bytes", step, codes.Code(got.Status.GetCode()), len(got.Data))
+					}
+				case absent.Hash:
+					if codes.Code(got.Status.GetCode()) != codes.NotFound || len(got.Data) != 0 {
+						return fmt.Errorf("step %d absent model blob returned status %s and %d bytes", step, codes.Code(got.Status.GetCode()), len(got.Data))
+					}
+				default:
+					return fmt.Errorf("step %d model batch read returned unrequested digest %q", step, got.Digest.GetHash())
+				}
+			}
+			if seen[entry.digest.Hash] != 1 || seen[absent.Hash] != 1 {
+				return fmt.Errorf("step %d model batch response correlation = %v", step, seen)
+			}
+		case 3: // FindMissingBlobs over a state-dependent mixture.
+			entry, absent := pickEntry(), unknown()
+			resp, err := c.cas.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{entry.digest, absent}})
+			if err != nil {
+				return fmt.Errorf("step %d model find missing: %w", step, err)
+			}
+			if len(resp.MissingBlobDigests) != 1 || !proto.Equal(resp.MissingBlobDigests[0], absent) {
+				return fmt.Errorf("step %d missing set = %v, want only %v", step, resp.MissingBlobDigests, absent)
+			}
+		case 4: // ByteStream slice from something written by either API.
+			entry := pickEntry()
+			offset := rng.Intn(len(entry.data) + 1)
+			limit := rng.Intn(len(entry.data) - offset + 1)
+			stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(entry.digest), ReadOffset: int64(offset), ReadLimit: int64(limit)})
+			if err != nil {
+				return fmt.Errorf("step %d model stream read: %w", step, err)
+			}
+			got, err := readAll(stream)
+			if err != nil {
+				return fmt.Errorf("step %d model stream read: %w", step, err)
+			}
+			want := entry.data[offset:]
+			if limit > 0 {
+				want = want[:limit]
+			}
+			if !bytes.Equal(got, want) {
+				return fmt.Errorf("step %d model slice returned %d bytes, want %d", step, len(got), len(want))
+			}
+		case 5: // A failed mutation must leave existing model state unchanged.
+			entry := pickEntry()
+			bad := append([]byte(nil), entry.data...)
+			bad[rng.Intn(len(bad))] ^= 0xff
+			resp, err := c.cas.BatchUpdateBlobs(ctx, &repb.BatchUpdateBlobsRequest{Requests: []*repb.BatchUpdateBlobsRequest_Request{{Digest: entry.digest, Data: bad}}})
+			if err == nil && (len(resp.Responses) != 1 || codes.Code(resp.Responses[0].Status.GetCode()) == codes.OK) {
+				return fmt.Errorf("step %d accepted mutation under an existing digest", step)
+			}
+			stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(entry.digest)})
+			if err != nil {
+				return fmt.Errorf("step %d read after rejected mutation: %w", step, err)
+			}
+			got, err := readAll(stream)
+			if err != nil || !bytes.Equal(got, entry.data) {
+				return fmt.Errorf("step %d rejected mutation changed stored data: %v", step, err)
+			}
+		case 6: // Repeat reads to catch destructive or one-shot cache behavior.
+			entry := pickEntry()
+			for repeat := 0; repeat < 2; repeat++ {
+				stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(entry.digest)})
+				if err != nil {
+					return fmt.Errorf("step %d repeated read %d: %w", step, repeat, err)
+				}
+				got, err := readAll(stream)
+				if err != nil || !bytes.Equal(got, entry.data) {
+					return fmt.Errorf("step %d repeated read %d differed: %v", step, repeat, err)
+				}
+			}
+		case 7: // Unknown content stays unknown across both lookup APIs.
+			absent := unknown()
+			missing, err := c.cas.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{absent}})
+			if err != nil || len(missing.GetMissingBlobDigests()) != 1 {
+				return fmt.Errorf("step %d unknown digest missing lookup: %v", step, err)
+			}
+			stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(absent)})
+			if err != nil {
+				return fmt.Errorf("step %d open unknown digest: %w", step, err)
+			}
+			got, err := readAll(stream)
+			if status.Code(err) != codes.NotFound || len(got) != 0 {
+				return fmt.Errorf("step %d unknown digest read = %v after %d bytes", step, err, len(got))
+			}
+		}
 	}
 	return nil
 }}
@@ -1157,4 +1329,152 @@ func TestRandomREAPICacheTraffic(t *testing.T) {
 		}
 	}
 	t.Logf("completed %d operations: %v", iterations, counts)
+}
+
+// TestStatefulModelTraffic generates dependent sequences rather than isolated
+// requests. The model is deliberately small and explicit: successful writes
+// add bytes to it, and every subsequent read/update is checked against that
+// state. This catches bugs that only appear after a particular history of
+// uploads, overwrites, and resumptions.
+func TestStatefulModelTraffic(t *testing.T) {
+	seed := time.Now().UnixNano()
+	if value := os.Getenv("REAPI_SEED"); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			t.Fatalf("invalid REAPI_SEED: %v", err)
+		}
+		seed = parsed
+	}
+	rng := rand.New(rand.NewSource(seed))
+	iterations := 200
+	if value := os.Getenv("REAPI_MODEL_REQUESTS"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			t.Fatalf("invalid REAPI_MODEL_REQUESTS %q", value)
+		}
+		iterations = parsed
+	}
+	t.Logf("model seed: %d (reproduce with --test_env=REAPI_SEED=%d)", seed, seed)
+	// Keep enough capacity that the model can distinguish protocol/state bugs
+	// from ordinary eviction. Eviction pressure should be a separate model
+	// dimension with explicit expected-miss semantics.
+	inst := startBuildBuddy(t)
+	conn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", inst.grpcPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	awaitReady(t, conn, inst.exited)
+	c := &clients{cas: repb.NewContentAddressableStorageClient(conn), ac: repb.NewActionCacheClient(conn), bs: bspb.NewByteStreamClient(conn)}
+	model := make(map[string][]byte)
+	actions := make(map[string]*repb.ActionResult)
+	actionDigests := make(map[string]*repb.Digest)
+	remember := func(d *repb.Digest, data []byte) {
+		model[d.Hash] = append([]byte(nil), data...)
+		// Keep the oracle below the deliberately small cache ceiling. Older
+		// entries may legitimately have been evicted by the server.
+		for len(model) > 16 {
+			for key := range model {
+				delete(model, key)
+				break
+			}
+		}
+	}
+	rememberAction := func(d *repb.Digest, result *repb.ActionResult) {
+		actions[d.Hash] = result
+		actionDigests[d.Hash] = d
+		for len(actions) > 16 {
+			for key := range actions {
+				delete(actions, key)
+				delete(actionDigests, key)
+				break
+			}
+		}
+	}
+
+	for i := 0; i < iterations; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		choice := rng.Intn(5)
+		switch choice {
+		case 0: // Create or replace a model entry through CAS.
+			data := randomBytes(rng, rng.Intn(8*1024)+1)
+			d := digest(data)
+			if _, err := upload(ctx, c.cas, data); err != nil {
+				cancel()
+				t.Fatalf("iteration %d CAS write: %v", i, err)
+			}
+			remember(d, data)
+		case 1: // Read a previously written entry, preserving sequence dependence.
+			if len(model) == 0 {
+				cancel()
+				continue
+			}
+			var key string
+			for key = range model {
+				break
+			}
+			data := model[key]
+			d := digest(data)
+			resp, err := c.cas.BatchReadBlobs(ctx, &repb.BatchReadBlobsRequest{Digests: []*repb.Digest{d}})
+			if err != nil || len(resp.GetResponses()) != 1 || codes.Code(resp.Responses[0].Status.GetCode()) != codes.OK || !bytes.Equal(resp.Responses[0].Data, data) {
+				cancel()
+				t.Fatalf("iteration %d model CAS read mismatch: err=%v response=%v", i, err, resp)
+			}
+		case 2: // ByteStream write, then read the same model value back.
+			data := randomBytes(rng, rng.Intn(8*1024)+1)
+			if err := writeChunked(ctx, c.bs, rng, data); err != nil {
+				cancel()
+				t.Fatalf("iteration %d ByteStream write: %v", i, err)
+			}
+			d := digest(data)
+			remember(d, data)
+			stream, err := c.bs.Read(ctx, &bspb.ReadRequest{ResourceName: readResource(d)})
+			got, readErr := []byte(nil), err
+			if err == nil {
+				got, readErr = readAll(stream)
+			}
+			if readErr != nil || !bytes.Equal(got, data) {
+				cancel()
+				t.Fatalf("iteration %d model ByteStream read mismatch: err=%v bytes=%d want=%d", i, readErr, len(got), len(data))
+			}
+		case 3: // Action Cache state depends on a CAS command digest.
+			command, _ := proto.Marshal(&repb.Command{Arguments: []string{"model", fmt.Sprint(i), fmt.Sprint(rng.Uint64())}})
+			d, err := upload(ctx, c.cas, command)
+			if err != nil {
+				cancel()
+				t.Fatalf("iteration %d command upload: %v", i, err)
+			}
+			actionBytes, _ := proto.Marshal(&repb.Action{CommandDigest: d[0]})
+			actionDigest, err := upload(ctx, c.cas, actionBytes)
+			if err != nil {
+				cancel()
+				t.Fatalf("iteration %d action upload: %v", i, err)
+			}
+			want := &repb.ActionResult{ExitCode: int32(rng.Intn(256)), ExecutionMetadata: &repb.ExecutedActionMetadata{Worker: "model"}}
+			if _, err := c.ac.UpdateActionResult(ctx, &repb.UpdateActionResultRequest{ActionDigest: actionDigest[0], ActionResult: want}); err != nil {
+				cancel()
+				t.Fatalf("iteration %d action update: %v", i, err)
+			}
+			rememberAction(actionDigest[0], want)
+		case 4: // Read a modelled action, or assert a genuinely unknown action misses.
+			ad := digest(randomBytes(rng, 32))
+			if len(actions) > 0 {
+				for key := range actions {
+					ad = actionDigests[key]
+					break
+				}
+			}
+			got, err := c.ac.GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: ad})
+			if expected, ok := actions[ad.Hash]; ok {
+				if err != nil || !proto.Equal(got, expected) {
+					cancel()
+					t.Fatalf("iteration %d action model mismatch: err=%v got=%v want=%v", i, err, got, expected)
+				}
+			} else if status.Code(err) != codes.NotFound {
+				cancel()
+				t.Fatalf("iteration %d unknown action status=%v", i, status.Code(err))
+			}
+		}
+		cancel()
+	}
 }
