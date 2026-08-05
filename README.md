@@ -48,6 +48,26 @@ Boundary and stress paths, driven by the limits the server itself advertises:
 - Concurrent writers and readers of the same digests must never expose a
   partial blob
 
+Every operation above is a self-contained round trip. One is not:
+`StatefulSequence` runs 25-49 dependent steps against a reference model,
+so a step is checked against the history that preceded it rather than against
+a value it just wrote itself. It is the only operation that crosses API
+boundaries within one history:
+
+- A blob written through ByteStream is read back through the CAS, and one
+  written through `BatchUpdateBlobs` is read back through ByteStream
+- A rejected write must leave the bytes already stored under that digest
+  untouched, not merely be reported as rejected
+- Reading the same blob twice must return the same bytes, so nothing is
+  one-shot or destructive
+- Action Cache entries are keyed by digests the sequence itself uploaded, and
+  a digest the sequence never cached a result under must still miss
+
+The model keeps its entries in insertion-ordered slices rather than maps.
+Selecting an entry by walking a map would make the choice depend on Go's
+randomized iteration order rather than on the seed, and a failure would not
+replay.
+
 Operations are weighted, so expensive probes stay rare and a long run remains
 dominated by ordinary cache traffic.
 
